@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: scanlin-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-scanlin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clave_segura}
+      POSTGRES_DB: ${POSTGRES_DB:-scanlindb}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [backend]
+
+  gateway:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: scanlin-gateway-1
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-scanlin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clave_segura}
+      POSTGRES_DB: ${POSTGRES_DB:-scanlindb}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      ENABLE_ARPING: "1"
+      ARP_IFACE: eth0         # en modo puente el tráfico sale por eth0 del contenedor
+    depends_on:
+      - postgres
+    cap_add:
+      - NET_RAW
+    ports:
+      - "${GATEWAY_PORT:-8020}:8000"
+    networks: [backend]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+
+networks:
+  backend:
