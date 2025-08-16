@@ -1,9 +1,9 @@
 # api/routers/scan.py
 from fastapi import APIRouter, HTTPException, Depends, Request, Query
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from ipaddress import ip_network
 from typing import List, Dict, Any, Optional
-import asyncio, re, json, socket, ssl, subprocess, os
+import asyncio, re, json, socket, ssl, subprocess, os, time
 from asyncio import gather, Semaphore, create_subprocess_exec, subprocess as asp
 from sqlmodel import select
 from api.models.device import Device
@@ -47,9 +47,9 @@ async def ping_host(ip: str) -> bool:
 def get_mac_best_effort(ip: str) -> str:
     """
     Intentos para obtener MAC desde el host:
-    - arping (opcional)
     - ip neigh
     - /proc/net/arp
+    (arping opcional si ENABLE_ARPING=1)
     """
     import re, subprocess
     from asyncio import subprocess as asp
@@ -58,8 +58,8 @@ def get_mac_best_effort(ip: str) -> str:
         m = re.search(r'(([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})', s or '')
         return m.group(1).lower() if m else ""
 
-    # Opción: ARP activo, si está habilitado y existe "arping"
-    if os.getenv("ENABLE_ARPING", "0") == "1":
+    # Opción: ARP activo, si ENABLE_ARPING está habilitado
+    if os.getenv("ENABLE_ARPING", "0") == "1" and _has_cmd("arping"):
         iface = os.getenv("ARP_IFACE", "eth0")
         try:
             subprocess.run(
@@ -213,6 +213,111 @@ async def scan_subnet(request: Request, session: AsyncSession = Depends(get_sess
     await session.commit()
     return nuevos
 
+# ---------- Probe helper: detección estricta para evitar falsos UP ----------
+async def tcp_connect_one(ip: str, port: int, timeout: float = 0.6) -> bool:
+    """
+    TCP connect quick check executed on executor to avoid blocking loop.
+    """
+    def try_conn():
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect((ip, port))
+            s.close()
+            return True
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+            return False
+    return await asyncio.get_event_loop().run_in_executor(None, try_conn)
+
+async def arping_probe(ip: str, iface: Optional[str] = None, count: int = 1, timeout: int = 2) -> bool:
+    if not _has_cmd("arping"):
+        return False
+    cmd = ["arping", "-c", str(count)]
+    if iface:
+        cmd += ["-I", iface]
+    cmd += [ip]
+    try:
+        await asyncio.to_thread(subprocess.check_output, cmd, stderr=subprocess.STDOUT, timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+async def probe_host_strict(ip: str, iface_hint: Optional[str] = None, retries: int = 2):
+    """
+    Strategy for robust detection:
+      - Collect votes from ICMP, ARP (if available) and TCP.
+      - Return a dict with alive, confidence (0..1), methods, tcp_port.
+      - Decision rules: tcp_ok -> alive, arp+icmp -> alive, else confidence >= 0.6 -> alive.
+    """
+    methods = []
+    votes = 0
+    max_votes = 3  # icmp, arp, tcp
+
+    # ICMP attempts
+    icmp_ok = False
+    for _ in range(retries):
+        try:
+            ok = await ping_host(ip)
+            if ok:
+                icmp_ok = True
+                votes += 1
+                methods.append("icmp")
+                break
+        except Exception:
+            pass
+
+    # ARP (if available)
+    arp_ok = False
+    if _has_cmd("arping"):
+        try:
+            arp_ok = await arping_probe(ip, iface_hint, count=1)
+            if arp_ok:
+                votes += 1
+                methods.append("arp")
+        except Exception:
+            pass
+
+    # TCP quick check on common ports
+    tcp_ports = (80, 443, 22, 445, 8080)
+    tcp_ok = False
+    tcp_success_port = None
+    for p in tcp_ports:
+        ok = await tcp_connect_one(ip, p, timeout=0.5)
+        if ok:
+            tcp_ok = True
+            tcp_success_port = p
+            votes += 1
+            methods.append(f"tcp/{p}")
+            break
+
+    confidence = round(votes / max_votes, 2)
+    alive = False
+    if tcp_ok:
+        alive = True
+    elif arp_ok and icmp_ok:
+        alive = True
+    elif confidence >= 0.6:
+        alive = True
+    else:
+        alive = False
+
+    return {
+        "alive": alive,
+        "confidence": confidence,
+        "methods": methods,
+        "tcp_port": tcp_success_port
+    }
+
+# Diagnostic HTTP endpoint: probe single IP on demand
+@router.get("/probe")
+async def probe_one_ip(ip: str = Query(..., description="IP a sondear"), iface: Optional[str] = Query(None, description="iface para arping (opcional)")):
+    res = await probe_host_strict(ip, iface_hint=iface, retries=2)
+    return JSONResponse(content={"ip": ip, **res})
+
 # ---------- Streaming SSE: red en paralelo, BD por lotes opcional ----------
 @router.get("/scan/stream")
 async def scan_stream(
@@ -245,10 +350,6 @@ async def scan_stream(
             queue = asyncio.Queue()
 
             async def db_writer(q: asyncio.Queue, sess: AsyncSession):
-                """
-                Consume la cola y escribe en Postgres por lotes.
-                Usa sess.begin() para transacciones y evita commits por cada fila.
-                """
                 buf: List[Dict[str, Any]] = []
                 BATCH = 50
                 while True:
@@ -256,7 +357,6 @@ async def scan_stream(
                     if item is None:
                         continue
                     if isinstance(item, dict) and item.get("__done__"):
-                        # flush
                         if buf:
                             async with sess.begin():
                                 for d in buf:
@@ -299,18 +399,20 @@ async def scan_stream(
 
             writer_task = asyncio.create_task(db_writer(queue, session))
 
-        # Worker que realiza checks por IP (resolve en hilo si es bloqueante)
+        # Worker que realiza checks por IP (usa probe_host_strict)
         async def worker(ip: str) -> Dict[str, Any]:
-            ok = await ping_host(ip)
-            d: Dict[str, Any] = {"ip": ip, "alive": ok}
-            if ok:
-                # funciones bloqueantes ejecutadas en hilos
-                name = await asyncio.to_thread(resolve_name_best_effort, ip)
-                mac = await asyncio.to_thread(get_mac_best_effort, ip)
-                d["name"] = name
-                d["mac"] = mac
+            # Ejecuta la estrategia estricta
+            res = await probe_host_strict(ip, iface_hint=os.getenv("ARP_IFACE", None), retries=2)
+            d: Dict[str, Any] = {"ip": ip, "alive": res["alive"], "confidence": res["confidence"], "probe_methods": res["methods"]}
+            if res.get("tcp_port"):
+                d["tcp_port"] = res["tcp_port"]
+            if res["alive"]:
+                # enriquecimiento en hilos
+                d["name"] = await asyncio.to_thread(resolve_name_best_effort, ip)
+                d["mac"] = await asyncio.to_thread(get_mac_best_effort, ip)
             return d
 
+        # Lanzamos workers concurrentes
         tasks = [asyncio.create_task(worker(ip)) for ip in hosts]
         done = 0
 
@@ -319,21 +421,19 @@ async def scan_stream(
             try:
                 d = await coro
             except Exception:
-                # en caso de error en worker, avanzar y seguir
                 d = {"ip": "error", "alive": False}
             done += 1
 
-            # si persistimos, encolar solo los vivos (o la política que prefieras)
+            # si persistimos, encolar solo los vivos
             if persist and d.get("alive"):
                 await queue.put(d)
 
             d.update({"done": done, "total": total})
-            # emitir evento data por cada host
+            # emitir evento data por cada host (incluye confidence y probe_methods)
             yield f"data: {json.dumps(d)}\n\n"
 
         # finalizar writer si existe
         if persist:
-            # enviar sentinel y esperar a que termine
             await queue.put(SENTINEL)
             if writer_task:
                 await writer_task
