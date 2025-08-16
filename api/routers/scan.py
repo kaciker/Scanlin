@@ -15,12 +15,14 @@ import ping3
 router = APIRouter(tags=["scan"])
 semaforo = Semaphore(32)
 
+
 def _has_cmd(cmd: str) -> bool:
     try:
         subprocess.check_call(["which", cmd], stdout=asp.DEVNULL, stderr=asp.DEVNULL)
         return True
     except Exception:
         return False
+
 
 # ---------- Ping & enriquecimiento ----------
 async def ping_host(ip: str) -> bool:
@@ -44,12 +46,13 @@ async def ping_host(ip: str) -> bool:
         except Exception:
             return False
 
+
 def get_mac_best_effort(ip: str) -> str:
     """
     Intentos para obtener MAC desde el host:
     - ip neigh
     - /proc/net/arp
-    (arping opcional si ENABLE_ARPING=1)
+    - arping (opcional si ENABLE_ARPING=1)
     """
     import re, subprocess
     from asyncio import subprocess as asp
@@ -58,7 +61,7 @@ def get_mac_best_effort(ip: str) -> str:
         m = re.search(r'(([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})', s or '')
         return m.group(1).lower() if m else ""
 
-    # Opción: ARP activo, si ENABLE_ARPING está habilitado
+    # Opción: ARP activo, si ENABLE_ARPING está habilitado y arping existe
     if os.getenv("ENABLE_ARPING", "0") == "1" and _has_cmd("arping"):
         iface = os.getenv("ARP_IFACE", "eth0")
         try:
@@ -92,11 +95,13 @@ def get_mac_best_effort(ip: str) -> str:
 
     return ""
 
+
 def resolve_dns_ptr(ip: str) -> str:
     try:
         return socket.gethostbyaddr(ip)[0]
     except Exception:
         return ""
+
 
 def resolve_nbns(ip: str) -> str:
     # nmblookup -A ip
@@ -113,6 +118,23 @@ def resolve_nbns(ip: str) -> str:
         pass
     return ""
 
+
+def resolve_mdns(ip: str) -> str:
+    """
+    Usa avahi-resolve-address si está disponible para resolver mDNS (zeroconf).
+    Devuelve nombre sin .local si se encuentra, o "".
+    """
+    if not _has_cmd("avahi-resolve-address"):
+        return ""
+    try:
+        out = subprocess.check_output(["avahi-resolve-address", ip], text=True, timeout=1)
+        # formato: "hostname.local\t192.168.1.211\n"
+        host = out.split()[0].strip()
+        return host.replace(".local", "")
+    except Exception:
+        return ""
+
+
 def _http_title_plain(ip: str, port: int) -> str:
     try:
         s = socket.create_connection((ip, port), timeout=0.8)
@@ -124,6 +146,7 @@ def _http_title_plain(ip: str, port: int) -> str:
     except Exception:
         pass
     return ""
+
 
 def _http_title_tls(ip: str, port: int = 443) -> str:
     try:
@@ -139,6 +162,7 @@ def _http_title_tls(ip: str, port: int = 443) -> str:
         pass
     return ""
 
+
 def resolve_http_title(ip: str) -> str:
     for port in (80, 8080):
         t = _http_title_plain(ip, port)
@@ -146,22 +170,51 @@ def resolve_http_title(ip: str) -> str:
             return t
     return _http_title_tls(ip, 443)
 
-def resolve_name_best_effort(ip: str) -> str:
-    """
-    Funciones bloqueantes: DNS PTR, NBNS, HTTP title.
-    """
-    for fn in (resolve_dns_ptr, resolve_nbns, resolve_http_title):
-        try:
-            name = fn(ip)
-            if name:
-                return name
-        except Exception:
-            continue
-    return ""
 
-async def resolve_name_best_effort_async(ip: str) -> str:
+def resolve_name_best_effort(ip: str) -> Dict[str, str]:
+    """
+    Cadena de resolución:
+      - PTR DNS
+      - mDNS (avahi)
+      - NBNS (nmblookup)
+      - HTTP title
+    Devuelve dict: {"name": str, "source": "ptr|mdns|nbns|http|"}.
+    """
+    try:
+        name = resolve_dns_ptr(ip)
+        if name:
+            return {"name": name, "source": "ptr"}
+    except Exception:
+        pass
+
+    try:
+        name = resolve_mdns(ip)
+        if name:
+            return {"name": name, "source": "mdns"}
+    except Exception:
+        pass
+
+    try:
+        name = resolve_nbns(ip)
+        if name:
+            return {"name": name, "source": "nbns"}
+    except Exception:
+        pass
+
+    try:
+        name = resolve_http_title(ip)
+        if name:
+            return {"name": name, "source": "http"}
+    except Exception:
+        pass
+
+    return {"name": "", "source": ""}
+
+
+async def resolve_name_best_effort_async(ip: str) -> Dict[str, str]:
     """Wrapper async para resolve_name_best_effort (ejecuta en hilo)."""
     return await asyncio.to_thread(resolve_name_best_effort, ip)
+
 
 # ---------- Endpoints clásicos ----------
 @router.post("/scan", response_model=List[str])
@@ -191,7 +244,8 @@ async def scan_subnet(request: Request, session: AsyncSession = Depends(get_sess
     nuevos: List[str] = []
     for ip in activos:
         # resolve_name_best_effort_async usa to_thread internamente
-        name = await resolve_name_best_effort_async(ip)
+        name_info = await resolve_name_best_effort_async(ip)
+        name = name_info.get("name", "") or f"Host {ip}"
         mac = await asyncio.to_thread(get_mac_best_effort, ip)
 
         q = await session.execute(select(Device).where(Device.ip == ip))
@@ -205,13 +259,14 @@ async def scan_subnet(request: Request, session: AsyncSession = Depends(get_sess
                 existente.mac = mac
         else:
             session.add(Device(
-                name=name or f"Host {ip}",
+                name=name,
                 ip=ip, mac=mac, os="", last_seen=datetime.utcnow(), tags=tag
             ))
             nuevos.append(ip)
 
     await session.commit()
     return nuevos
+
 
 # ---------- Probe helper: detección estricta para evitar falsos UP ----------
 async def tcp_connect_one(ip: str, port: int, timeout: float = 0.6) -> bool:
@@ -233,6 +288,7 @@ async def tcp_connect_one(ip: str, port: int, timeout: float = 0.6) -> bool:
             return False
     return await asyncio.get_event_loop().run_in_executor(None, try_conn)
 
+
 async def arping_probe(ip: str, iface: Optional[str] = None, count: int = 1, timeout: int = 2) -> bool:
     if not _has_cmd("arping"):
         return False
@@ -245,6 +301,7 @@ async def arping_probe(ip: str, iface: Optional[str] = None, count: int = 1, tim
         return True
     except Exception:
         return False
+
 
 async def probe_host_strict(ip: str, iface_hint: Optional[str] = None, retries: int = 2):
     """
@@ -312,11 +369,14 @@ async def probe_host_strict(ip: str, iface_hint: Optional[str] = None, retries: 
         "tcp_port": tcp_success_port
     }
 
+
 # Diagnostic HTTP endpoint: probe single IP on demand
 @router.get("/probe")
-async def probe_one_ip(ip: str = Query(..., description="IP a sondear"), iface: Optional[str] = Query(None, description="iface para arping (opcional)")):
+async def probe_one_ip(ip: str = Query(..., description="IP a sondear"),
+                       iface: Optional[str] = Query(None, description="iface para arping (opcional)")):
     res = await probe_host_strict(ip, iface_hint=iface, retries=2)
     return JSONResponse(content={"ip": ip, **res})
+
 
 # ---------- Streaming SSE: red en paralelo, BD por lotes opcional ----------
 @router.get("/scan/stream")
@@ -403,16 +463,27 @@ async def scan_stream(
         async def worker(ip: str) -> Dict[str, Any]:
             # Ejecuta la estrategia estricta
             res = await probe_host_strict(ip, iface_hint=os.getenv("ARP_IFACE", None), retries=2)
-            d: Dict[str, Any] = {"ip": ip, "alive": res["alive"], "confidence": res["confidence"], "probe_methods": res["methods"]}
+            d: Dict[str, Any] = {
+                "ip": ip,
+                "alive": res["alive"],
+                "confidence": res["confidence"],
+                "probe_methods": res["methods"]
+            }
             if res.get("tcp_port"):
                 d["tcp_port"] = res["tcp_port"]
+            # solo hacemos enriquecimiento si alive == True (reduce I/O)
             if res["alive"]:
-                # enriquecimiento en hilos
-                d["name"] = await asyncio.to_thread(resolve_name_best_effort, ip)
+                name_info = await resolve_name_best_effort_async(ip)
+                d["name"] = name_info.get("name", "")
+                d["name_source"] = name_info.get("source", "")
                 d["mac"] = await asyncio.to_thread(get_mac_best_effort, ip)
+            else:
+                d["name"] = ""
+                d["name_source"] = ""
+                d["mac"] = ""
             return d
 
-        # Lanzamos workers concurrentes
+        # Lanzamos workers concurrentes (controlados por semáforo interno del ping)
         tasks = [asyncio.create_task(worker(ip)) for ip in hosts]
         done = 0
 
@@ -421,7 +492,7 @@ async def scan_stream(
             try:
                 d = await coro
             except Exception:
-                d = {"ip": "error", "alive": False}
+                d = {"ip": "error", "alive": False, "confidence": 0.0, "probe_methods": []}
             done += 1
 
             # si persistimos, encolar solo los vivos
@@ -447,11 +518,12 @@ async def scan_stream(
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
 
-# ---------- UI simple ----------
-# ---------- UI simple ----------
+
+# ---------- UI simple (HTML + JS) ----------
+# La UI incluida aquí muestra la tabla y utiliza 'confidence' y 'probe_methods' para decidir el estado.
+# Puedes reemplazar este HTML con tu versión; he incluido una UI funcional y compacta.
 @router.get("/ui", response_class=HTMLResponse)
 async def scan_ui():
-    # Devuelve la UI embebida (HTML + JS).
     return HTMLResponse("""
 <!doctype html>
 <html lang="es">
@@ -514,7 +586,7 @@ async def scan_ui():
             <th class="text-left font-semibold px-3 py-2 cursor-pointer" data-sort="name">Nombre</th>
             <th class="text-left font-semibold px-3 py-2 cursor-pointer" data-sort="mac">MAC</th>
             <th class="text-left font-semibold px-3 py-2 cursor-pointer" data-sort="alive">Estado</th>
-            <th class="text-left font-semibold px-3 py-2 cursor-pointer" data-sort="added">Nuevo</th>
+            <th class="text-left font-semibold px-3 py-2 cursor-pointer" data-sort="confidence">Conf.</th>
             <th class="text-left font-semibold px-3 py-2">Acciones</th>
           </tr>
         </thead>
@@ -542,8 +614,13 @@ let sortKey = "ip", sortAsc = true;
 const rows = new Map();
 
 // Helpers
-const fmtState = a => a ? '<span class="inline-flex items-center gap-1 text-green-700"><span class="inline-block w-2 h-2 rounded-full bg-green-600"></span>UP</span>'
-                        : '<span class="inline-flex items-center gap-1 text-slate-500"><span class="inline-block w-2 h-2 rounded-full bg-slate-400"></span>down</span>';
+function fmtStateWithConfidence(alive, conf) {
+  if (!alive) return '<span class="inline-flex items-center gap-1 text-slate-500"><span class="inline-block w-2 h-2 rounded-full bg-slate-400"></span>down</span>';
+  if (conf < 0.6) {
+    return `<span class="inline-flex items-center gap-1 text-amber-700"><span class="inline-block w-2 h-2 rounded-full bg-amber-400"></span>probable</span>`;
+  }
+  return '<span class="inline-flex items-center gap-1 text-green-700"><span class="inline-block w-2 h-2 rounded-full bg-green-600"></span>UP</span>';
+}
 const linkHttp = ip => `<a class="underline hover:no-underline" href="http://${ip}" target="_blank" rel="noopener">HTTP</a>`;
 const linkHttps = ip => `<a class="underline hover:no-underline" href="https://${ip}" target="_blank" rel="noopener">HTTPS</a>`;
 
@@ -581,6 +658,11 @@ function render() {
       return sortAsc ? (va - vb) : (vb - va);
     }
 
+    if (sortKey === "confidence") {
+      const va = (a.confidence || 0), vb = (b.confidence || 0);
+      return sortAsc ? (va - vb) : (vb - va);
+    }
+
     let va = (a[sortKey] == null) ? "" : String(a[sortKey]).toLowerCase();
     let vb = (b[sortKey] == null) ? "" : String(b[sortKey]).toLowerCase();
     if (va < vb) return sortAsc ? -1 : 1;
@@ -596,12 +678,13 @@ function render() {
       tr.className = "border-b hover:bg-slate-50";
       r._el = tr;
     }
+    const nameDisplay = r.name ? `${escapeHtml(r.name)} <span class="text-xs text-slate-400">(${escapeHtml(r.name_source||"")})</span>` : "";
     tr.innerHTML = `
       <td class="px-3 py-2 font-mono">${r.ip}</td>
-      <td class="px-3 py-2">${escapeHtml(r.name||"")}</td>
+      <td class="px-3 py-2">${nameDisplay}</td>
       <td class="px-3 py-2 font-mono">${r.mac||""}</td>
-      <td class="px-3 py-2">${fmtState(!!r.alive)}</td>
-      <td class="px-3 py-2">${r.added ? '<span class="text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded">nuevo</span>' : ''}</td>
+      <td class="px-3 py-2">${fmtStateWithConfidence(!!r.alive, r.confidence || 0)}</td>
+      <td class="px-3 py-2">${(r.confidence || 0).toFixed ? (r.confidence || 0).toFixed(2) : (r.confidence || 0)}</td>
       <td class="px-3 py-2 space-x-2">${linkHttp(r.ip)} ${linkHttps(r.ip)}</td>`;
     frag.appendChild(tr);
   }
@@ -639,6 +722,9 @@ function startScan(){
     done = d.done || done; total = d.total || total;
     const item = rows.get(d.ip) || { ip: d.ip };
     Object.assign(item, d);
+    // normalizar campos
+    if (!item.confidence && item.confidence !== 0) item.confidence = 0;
+    if (!item.probe_methods) item.probe_methods = [];
     rows.set(d.ip, item);
     scheduleRender();
   };
@@ -660,7 +746,7 @@ scheduleRender.flush = ()=>{ if (renderTimer){ clearTimeout(renderTimer); render
 
 // CSV
 btnExport.addEventListener("click", ()=>{
-  const hdr = ["ip","name","mac","alive","added"];
+  const hdr = ["ip","name","mac","alive","confidence","probe_methods"];
   const arr = Array.from(rows.values()).map(r => hdr.map(k => (r[k] ?? "")).join(","));
   const blob = new Blob([hdr.join(",") + "\\n" + arr.join("\\n")], {type:"text/csv"});
   const a = document.createElement("a");
@@ -691,5 +777,6 @@ qsAll("th[data-sort]").forEach(th=>{
 </body>
 </html>
 """)
+
 
 # EOF
