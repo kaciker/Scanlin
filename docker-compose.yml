@@ -28,6 +28,8 @@ services:
     ports: []   # con macvlan, nada que publicar
     environment:
       DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-scanlin}:${POSTGRES_PASSWORD:-scanlin}@postgres:5432/${POSTGRES_DB:-scanlin}"
+      OUI_MANUF: /app/data/manuf
+      OUI_URL: ""        # ← vacío para NO descargar CSV
     depends_on:
       postgres:
         condition: service_healthy
