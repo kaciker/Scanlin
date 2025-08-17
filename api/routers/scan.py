@@ -525,257 +525,385 @@ async def scan_stream(
 @router.get("/ui", response_class=HTMLResponse)
 async def scan_ui():
     return HTMLResponse("""
-<!doctype html>
-<html lang="es">
+<!DOCTYPE html>
+<html lang="es" class="h-full">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>ScanLin — Escaneo en tiempo real</title>
-<script src="https://cdn.tailwindcss.com"></script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ScanLin · IP Scanner</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'%3E%3Ccircle cx='48' cy='48' r='44' fill='%230ea5e9'/%3E%3Cpath d='M48 20a28 28 0 1028 28A28.03 28.03 0 0048 20zm0 50a22 22 0 1122-22 22 22 0 01-22 22z' fill='white'/%3E%3Ccircle cx='48' cy='48' r='8' fill='white'/%3E%3C/svg%3E" />
+  <!-- Tailwind (ok para desarrollo; en prod usa CLI/PostCSS) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <meta name="color-scheme" content="light dark" />
+  <style>
+    /* Evita parpadeos de barra de progreso */
+    #bar { transition: width .25s ease; }
+    /* Evita reflow al mostrar/ocultar spinner */
+    #spinner { width: 1.5rem; height: 1.5rem; }
+    /* Tabla monoespaciada en IP/MAC */
+    .mono { font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; }
+    /* Estado “pill” */
+    .pill { border-radius: 9999px; padding: .125rem .5rem; font-size: .75rem; font-weight: 600; }
+    /* Toast */
+    .toast { animation: slideIn .25s ease; }
+    @keyframes slideIn { from { transform: translateY(-6px); opacity:.0 } to { transform: translateY(0); opacity:1 } }
+  </style>
 </head>
-<body class="bg-slate-50 text-slate-900">
-  <div class="max-w-7xl mx-auto p-6 space-y-4">
-    <!-- Toolbar -->
-    <div class="flex flex-col gap-3 md:flex-row md:items-end md:gap-4">
-      <div class="flex-1">
-        <label class="block text-sm font-medium mb-1">Subred (CIDR)</label>
-        <input id="subnet" class="w-full border rounded px-3 py-2" placeholder="192.168.31.0/24" value="192.168.31.0/24"/>
-      </div>
-      <div>
-        <label class="block text-sm font-medium mb-1">Tag</label>
-        <input id="tag" class="w-40 border rounded px-3 py-2" placeholder="oficina" value="oficina"/>
-      </div>
-      <div class="flex items-center gap-2">
-        <button id="btn-scan" class="bg-blue-600 hover:bg-blue-700 text-white rounded px-4 py-2">Escanear</button>
-        <button id="btn-stop" class="bg-slate-200 hover:bg-slate-300 text-slate-900 rounded px-4 py-2">Detener</button>
-      </div>
-    </div>
-
-    <!-- Filtros -->
-    <div class="flex flex-col md:flex-row gap-3 md:items-center justify-between">
+<body class="h-full bg-slate-50 text-slate-900">
+  <div class="min-h-full mx-auto max-w-screen-xl p-4 sm:p-6">
+    <!-- Header -->
+    <header class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
       <div class="flex items-center gap-3">
-        <label class="inline-flex items-center gap-2 text-sm">
-          <input id="only-up" type="checkbox" class="accent-blue-600">
-          Mostrar solo UP
-        </label>
-        <label class="inline-flex items-center gap-2 text-sm">
-          <input id="only-new" type="checkbox" class="accent-blue-600">
-          Solo nuevos
-        </label>
+        <div class="size-9 rounded-xl bg-sky-500 grid place-items-center">
+          <svg viewBox="0 0 20 20" class="size-5 text-white" fill="currentColor" aria-hidden="true">
+            <path fill-rule="evenodd" d="M10 1.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17Zm0 3a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11Z" clip-rule="evenodd"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="text-xl sm:text-2xl font-bold leading-tight">ScanLin · IP Scanner</h1>
+          <p class="text-sm text-slate-500">Escaneo rápido por subred con eventos SSE en tiempo real</p>
+        </div>
       </div>
+
+      <!-- Acciones -->
       <div class="flex items-center gap-2">
-        <input id="search" class="border rounded px-3 py-2 w-64" placeholder="Buscar IP / nombre / MAC"/>
-        <button id="btn-export" class="border rounded px-3 py-2">Exportar CSV</button>
-      </div>
-    </div>
+        <!-- Spinner que cambia de color según estado -->
+        <div id="spinner" class="hidden relative" aria-live="polite" aria-label="Escaneando…">
+          <div id="spinRing" class="animate-spin rounded-full border-4 border-sky-600 border-t-transparent"></div>
+        </div>
 
-    <!-- Progreso -->
-    <div>
-      <div class="w-full bg-slate-200 rounded h-2 mb-2 overflow-hidden">
-        <div id="bar" class="bg-blue-600 h-2" style="width:0%"></div>
+        <button id="btn-scan" class="inline-flex items-center gap-2 bg-sky-600 hover:bg-sky-700 text-white rounded-lg px-4 py-2">
+          <svg viewBox="0 0 20 20" class="size-4" fill="currentColor"><path d="M3 10a7 7 0 1 1 3.89 6.28l-2.3.77a1 1 0 0 1-1.26-1.26l.77-2.3A6.98 6.98 0 0 1 3 10Z"/></svg>
+          Escanear
+        </button>
+        <button id="btn-stop" class="inline-flex items-center gap-2 bg-slate-200 hover:bg-slate-300 text-slate-900 rounded-lg px-4 py-2">
+          <svg viewBox="0 0 20 20" class="size-4" fill="currentColor"><path d="M6 6h8v8H6z"/></svg>
+          Detener
+        </button>
       </div>
-      <div id="stats" class="text-sm text-slate-600">0 / 0</div>
-    </div>
+    </header>
 
-    <!-- Tabla -->
-    <div class="border rounded-xl bg-white overflow-auto">
-      <table class="min-w-full text-sm" id="grid">
-        <thead class="sticky top-0 bg-slate-100 border-b">
-          <tr>
-            <th class="text-left font-semibold px-3 py-2 cursor-pointer" data-sort="ip">IP</th>
-            <th class="text-left font-semibold px-3 py-2 cursor-pointer" data-sort="name">Nombre</th>
-            <th class="text-left font-semibold px-3 py-2 cursor-pointer" data-sort="mac">MAC</th>
-            <th class="text-left font-semibold px-3 py-2 cursor-pointer" data-sort="alive">Estado</th>
-            <th class="text-left font-semibold px-3 py-2 cursor-pointer" data-sort="confidence">Conf.</th>
-            <th class="text-left font-semibold px-3 py-2">Acciones</th>
-          </tr>
-        </thead>
-        <tbody id="tbody"></tbody>
-      </table>
-    </div>
+    <!-- Panel de opciones -->
+    <section class="mb-4 rounded-xl border bg-white p-3 shadow-sm">
+      <div class="grid grid-cols-1 md:grid-cols-5 gap-3">
+        <label class="block">
+          <span class="text-xs font-medium text-slate-600">Subred (CIDR)</span>
+          <input id="subnet" type="text" inputmode="numeric"
+                 class="mt-1 w-full rounded-lg border px-3 py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                 placeholder="192.168.31.0/24" value="192.168.31.0/24" />
+        </label>
+        <label class="block">
+          <span class="text-xs font-medium text-slate-600">Tag</span>
+          <input id="tag" type="text"
+                 class="mt-1 w-full rounded-lg border px-3 py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                 placeholder="mi-escaneo" value="ui" />
+        </label>
+        <div class="flex items-end gap-4 md:col-span-3">
+          <label class="inline-flex items-center gap-2">
+            <input id="onlyAlive" type="checkbox" class="size-4" />
+            <span class="text-sm text-slate-700">Solo vivos</span>
+          </label>
+          <label class="inline-flex items-center gap-2">
+            <input id="autoResolve" type="checkbox" class="size-4" checked />
+            <span class="text-sm text-slate-700">Auto-resolver nombres</span>
+          </label>
+          <div class="ml-auto text-sm text-slate-500">
+            <kbd class="px-1.5 py-0.5 rounded bg-slate-100 border">Enter</kbd> para iniciar
+          </div>
+        </div>
+      </div>
+
+      <!-- Progreso -->
+      <div class="mt-3">
+        <div class="flex items-center justify-between mb-1">
+          <div class="text-xs text-slate-600">Progreso</div>
+          <div id="stats" class="text-xs font-semibold text-slate-800">0 / 0</div>
+        </div>
+        <div class="h-2 w-full overflow-hidden rounded-full bg-slate-100">
+          <div id="bar" class="h-2 w-0 rounded-full bg-sky-500"></div>
+        </div>
+        <div id="slowBanner" class="hidden mt-2 text-xs rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-amber-800">
+          Tarda en arrancar… verificando red/DNS/DB. Mantén el navegador abierto.
+        </div>
+      </div>
+    </section>
+
+    <!-- Tabla resultado -->
+    <section class="rounded-xl border bg-white shadow-sm">
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead class="bg-slate-100 text-slate-700">
+            <tr>
+              <th class="px-3 py-2 text-left">IP</th>
+              <th class="px-3 py-2 text-left">Nombre</th>
+              <th class="px-3 py-2 text-left">MAC</th>
+              <th class="px-3 py-2 text-left">Fabricante</th>
+              <th class="px-3 py-2 text-left">Estado</th>
+            </tr>
+          </thead>
+          <tbody id="tbody" class="divide-y divide-slate-100"></tbody>
+        </table>
+      </div>
+      <div id="emptyState" class="p-6 text-center text-slate-500 hidden">
+        Pulsa <strong>Escanear</strong> para comenzar.
+      </div>
+    </section>
+
+    <!-- Toasts -->
+    <div id="toasts" class="fixed top-4 left-0 right-0 mx-auto max-w-md space-y-2 z-50 pointer-events-none"></div>
   </div>
 
-<script>
-/* UI JS: EventSource + render throttled. Orden correcto por IP numérica incluido. */
-const $ = s => document.querySelector(s);
-const qsAll = (s, r=document) => Array.from(r.querySelectorAll(s));
+  <script type="module">
+    // ---- DOM ----
+    const $ = s => document.querySelector(s);
+    const tbody = $("#tbody");
+    const btnScan = $("#btn-scan");
+    const btnStop = $("#btn-stop");
+    const subnet = $("#subnet");
+    const tag = $("#tag");
+    const onlyAlive = $("#onlyAlive");
+    const autoResolve = $("#autoResolve");
 
-const tbody = $("#tbody"), bar = $("#bar"), stats = $("#stats");
-const btnScan = $("#btn-scan"), btnStop = $("#btn-stop");
-const subnetEl = $("#subnet"), tagEl = $("#tag");
-const onlyUpEl = $("#only-up"), onlyNewEl = $("#only-new"), searchEl = $("#search");
-const btnExport = $("#btn-export");
+    const stats = $("#stats");
+    const bar = $("#bar");
+    const spinner = $("#spinner");
+    const spinRing = $("#spinRing");
+    const slowBanner = $("#slowBanner");
+    const emptyState = $("#emptyState");
+    const toasts = $("#toasts");
 
-let es = null;                 // EventSource actual
-let total = 0, done = 0;
-let sortKey = "ip", sortAsc = true;
+    // ---- Estado ----
+    let es = null;
+    let firstPayloadAt = 0;
+    let startAt = 0;
+    let slowTimer = 0;
+    let redTimer = 0;
+    let done = 0, total = 0;
 
-// Datos en memoria (mapa por IP)
-const rows = new Map();
+    // ---- Helpers ----
+    const showToast = (text, type="error") => {
+      const el = document.createElement("div");
+      el.className = `toast pointer-events-auto rounded-lg border px-3 py-2 text-sm shadow ${
+        type==="error" ? "bg-rose-50 border-rose-200 text-rose-800" :
+        type==="warn"  ? "bg-amber-50 border-amber-200 text-amber-800" :
+                         "bg-emerald-50 border-emerald-200 text-emerald-800"}`
+      el.textContent = text;
+      toasts.appendChild(el);
+      setTimeout(()=> el.remove(), 3500);
+    };
 
-// Helpers
-function fmtStateWithConfidence(alive, conf) {
-  if (!alive) return '<span class="inline-flex items-center gap-1 text-slate-500"><span class="inline-block w-2 h-2 rounded-full bg-slate-400"></span>down</span>';
-  if (conf < 0.6) {
-    return `<span class="inline-flex items-center gap-1 text-amber-700"><span class="inline-block w-2 h-2 rounded-full bg-amber-400"></span>probable</span>`;
-  }
-  return '<span class="inline-flex items-center gap-1 text-green-700"><span class="inline-block w-2 h-2 rounded-full bg-green-600"></span>UP</span>';
-}
-const linkHttp = ip => `<a class="underline hover:no-underline" href="http://${ip}" target="_blank" rel="noopener">HTTP</a>`;
-const linkHttps = ip => `<a class="underline hover:no-underline" href="https://${ip}" target="_blank" rel="noopener">HTTPS</a>`;
+    const ipCmp = (a, b) => {
+      const pa = a.split(".").map(n=>+n), pb = b.split(".").map(n=>+n);
+      for (let i=0;i<4;i++){ if(pa[i]!==pb[i]) return pa[i]-pb[i]; }
+      return 0;
+    };
 
-// Convierte IPv4 a entero (0..2^32-1)
-function ipToNumber(ip) {
-  if (!ip) return 0;
-  const parts = ip.split('.').map(p => parseInt(p, 10) || 0);
-  return parts[0]*16777216 + parts[1]*65536 + parts[2]*256 + parts[3];
-}
+    // Modelo de filas
+    const model = (() => {
+      const rows = new Map(); // ip -> data
 
-// Render
-function render() {
-  const q = (searchEl.value||"").trim().toLowerCase();
-  const onlyUp = !!onlyUpEl.checked;
-  const onlyNew = !!onlyNewEl.checked;
+      const upsert = (d) => {
+        const ip = d.ip;
+        if (!ip) return;
+        const prev = rows.get(ip) || {};
+        const next = { ...prev, ...d };
+        rows.set(ip, next);
+      };
 
-  let arr = Array.from(rows.values()).filter(r => {
-    if (onlyUp && !r.alive) return false;
-    if (onlyNew && !r.added) return false;
-    if (!q) return true;
-    const blob = `${r.ip} ${r.name||""} ${r.mac||""}`.toLowerCase();
-    return blob.includes(q);
-  });
+      const list = () => Array.from(rows.values()).sort((a,b)=> ipCmp(a.ip,b.ip));
 
-  // Ordenado mejorado: si sortKey es "ip", usamos ipToNumber
-  arr.sort((a, b) => {
-    if (sortKey === "ip") {
-      const va = ipToNumber(a.ip), vb = ipToNumber(b.ip);
-      return sortAsc ? (va - vb) : (vb - va);
+      const clear = () => rows.clear();
+
+      return { upsert, list, clear };
+    })();
+
+    const render = () => {
+      const items = model.list().filter(r => !onlyAlive.checked || r.alive);
+      emptyState.classList.toggle("hidden", items.length !== 0);
+
+      tbody.innerHTML = items.map(r => {
+        const status = r.alive
+          ? `<span class="pill bg-emerald-100 text-emerald-700">UP</span>`
+          : `<span class="pill bg-slate-100 text-slate-600">down</span>`;
+        return `
+          <tr>
+            <td class="px-3 py-2 mono">${r.ip ?? ""}</td>
+            <td class="px-3 py-2">${r.name ?? ""}</td>
+            <td class="px-3 py-2 mono">${r.mac ?? ""}</td>
+            <td class="px-3 py-2">${r.vendor ?? ""}</td>
+            <td class="px-3 py-2">${status}</td>
+          </tr>
+        `;
+      }).join("");
+    };
+
+    const setProgress = () => {
+      stats.textContent = `${done} / ${total}`;
+      const pct = total ? Math.floor(done * 100 / total) : 0;
+      bar.style.width = pct + "%";
+    };
+
+    // ---- Spinner estados ----
+    const showSpinner = () => {
+      spinner.classList.remove("hidden");
+      // estado inicial: azul
+      spinRing.className = "animate-spin rounded-full border-4 border-sky-600 border-t-transparent";
+      slowBanner.classList.add("hidden");
+      // Si a los 3s no hay payload => ámbar + banner
+      clearTimeout(slowTimer);
+      slowTimer = setTimeout(() => {
+        if (!firstPayloadAt) {
+          spinRing.className = "animate-spin rounded-full border-4 border-amber-500 border-t-transparent";
+          slowBanner.classList.remove("hidden");
+        }
+      }, 3000);
+      // Si a los 10s tampoco, pasa a rojo y toast
+      clearTimeout(redTimer);
+      redTimer = setTimeout(() => {
+        if (!firstPayloadAt) {
+          spinRing.className = "animate-spin rounded-full border-4 border-rose-600 border-t-transparent";
+          showToast("El escaneo tarda en responder. ¿DB o DNS lentos?", "warn");
+        }
+      }, 10000);
+    };
+    const hideSpinner = () => {
+      spinner.classList.add("hidden");
+      slowBanner.classList.add("hidden");
+      clearTimeout(slowTimer);
+      clearTimeout(redTimer);
+    };
+
+    // ---- Auto-resolver nombres (opcional, caña suave) ----
+    let resolveQueue = new Set();
+    let resolveTimerId = 0;
+
+    const scheduleResolve = (ip) => {
+      if (!autoResolve.checked || !ip) return;
+      resolveQueue.add(ip);
+      if (!resolveTimerId) {
+        resolveTimerId = setTimeout(async () => {
+          const ips = Array.from(resolveQueue);
+          resolveQueue.clear();
+          resolveTimerId = 0;
+          try {
+            // Nota: esto llama a /v2/devices?search=; si tu backend ya manda nombre, no hace falta.
+            const q = encodeURIComponent(ips.slice(0,10).join(" "));
+            const r = await fetch(`/v2/devices?search=${q}`);
+            if (r.ok) {
+              const arr = await r.json();
+              const byIp = new Map(arr.map(x => [x.ip, x]));
+              ips.forEach(ip => {
+                const info = byIp.get(ip);
+                if (info && (info.name || info.mac || info.tags)) {
+                  model.upsert({
+                    ip,
+                    name: info.name || "",
+                    mac: info.mac || "",
+                  });
+                }
+              });
+              render();
+            }
+          } catch { /* silencio */ }
+        }, 300);
+      }
+    };
+
+    // ---- Control de SSE ----
+    function stopScan() {
+      if (es) { try { es.close(); } catch {} es = null; }
+      hideSpinner();
+      setProgress();
     }
 
-    if (sortKey === "alive" || sortKey === "added") {
-      const va = a[sortKey] ? 1 : 0;
-      const vb = b[sortKey] ? 1 : 0;
-      return sortAsc ? (va - vb) : (vb - va);
+    async function startScan() {
+      stopScan(); // por si había uno en curso
+      // Reset de estado
+      firstPayloadAt = 0; startAt = Date.now();
+      done = 0; total = 0; setProgress();
+      model.clear(); render();
+      emptyState.classList.add("hidden");
+      showSpinner();
+
+      const s = subnet.value.trim();
+      const t = tag.value.trim() || "ui";
+      const url = `/v2/scan/stream?subnet=${encodeURIComponent(s)}&tag=${encodeURIComponent(t)}`;
+
+      try {
+        es = new EventSource(url);
+
+        es.addEventListener("open", () => {
+          // console.debug("SSE open");
+        });
+
+        es.addEventListener("meta", e => {
+          try {
+            const m = JSON.parse(e.data || "{}");
+            total = m.total || 0;
+            setProgress();
+          } catch {}
+        });
+
+        es.addEventListener("end", () => {
+          setProgress();
+          stopScan();
+        });
+
+        es.onerror = () => {
+          showToast("Se perdió la conexión del stream.", "error");
+          stopScan();
+        };
+
+        es.onmessage = (e) => {
+          if (!firstPayloadAt) firstPayloadAt = Date.now();
+          try {
+            const d = JSON.parse(e.data || "{}");
+            if (d.total) total = d.total;
+            if (d.done) done = d.done;
+
+            // Si “solo vivos”, igualmente procesamos para stats, pero filtramos al pintar
+            if (d.ip) {
+              const row = {
+                ip: d.ip,
+                alive: !!d.alive,
+                name: d.name || "",
+                mac: d.mac || "",
+                vendor: d.vendor || "",
+              };
+              model.upsert(row);
+              if (autoResolve.checked && (!row.name || !row.mac)) scheduleResolve(row.ip);
+            }
+
+            setProgress();
+            render();
+
+            if (total && done >= total) {
+              stopScan();
+            }
+          } catch {}
+        };
+
+      } catch (err) {
+        showToast("No se pudo iniciar el escaneo.", "error");
+        stopScan();
+      }
     }
 
-    if (sortKey === "confidence") {
-      const va = (a.confidence || 0), vb = (b.confidence || 0);
-      return sortAsc ? (va - vb) : (vb - va);
-    }
+    // ---- Eventos UI ----
+    btnScan.addEventListener("click", startScan);
+    btnStop.addEventListener("click", stopScan);
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.metaKey && !ev.ctrlKey && !ev.shiftKey && !ev.altKey) {
+        startScan();
+      }
+    });
 
-    let va = (a[sortKey] == null) ? "" : String(a[sortKey]).toLowerCase();
-    let vb = (b[sortKey] == null) ? "" : String(b[sortKey]).toLowerCase();
-    if (va < vb) return sortAsc ? -1 : 1;
-    if (va > vb) return sortAsc ? 1 : -1;
-    return 0;
-  });
-
-  const frag = document.createDocumentFragment();
-  for (const r of arr) {
-    let tr = r._el;
-    if (!tr) {
-      tr = document.createElement("tr");
-      tr.className = "border-b hover:bg-slate-50";
-      r._el = tr;
-    }
-    const nameDisplay = r.name ? `${escapeHtml(r.name)} <span class="text-xs text-slate-400">(${escapeHtml(r.name_source||"")})</span>` : "";
-    tr.innerHTML = `
-      <td class="px-3 py-2 font-mono">${r.ip}</td>
-      <td class="px-3 py-2">${nameDisplay}</td>
-      <td class="px-3 py-2 font-mono">${r.mac||""}</td>
-      <td class="px-3 py-2">${fmtStateWithConfidence(!!r.alive, r.confidence || 0)}</td>
-      <td class="px-3 py-2">${(r.confidence || 0).toFixed ? (r.confidence || 0).toFixed(2) : (r.confidence || 0)}</td>
-      <td class="px-3 py-2 space-x-2">${linkHttp(r.ip)} ${linkHttps(r.ip)}</td>`;
-    frag.appendChild(tr);
-  }
-  tbody.replaceChildren(frag);
-
-  const pct = total ? Math.floor((done*100)/total) : 0;
-  bar.style.width = pct + "%";
-  stats.textContent = `${done} / ${total}`;
-}
-
-function escapeHtml(s){
-  return (s||"").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-}
-
-function resetView(){
-  rows.clear();
-  done = 0; total = 0;
-  tbody.innerHTML = ""; bar.style.width = "0%"; stats.textContent = "0 / 0";
-}
-
-function startScan(){
-  stopScan();
-  resetView();
-  const subnet = subnetEl.value.trim();
-  const tag = tagEl.value.trim() || "stream";
-  // Por defecto persist=false para UI rápida; añade &persist=true para guardar en BD.
-  const url = `/v2/scan/stream?subnet=${encodeURIComponent(subnet)}&tag=${encodeURIComponent(tag)}&persist=false`;
-
-  es = new EventSource(url);
-  es.addEventListener("meta", ev => {
-    const m = JSON.parse(ev.data); total = m.total||0; render();
-  });
-  es.onmessage = ev => {
-    const d = JSON.parse(ev.data);
-    done = d.done || done; total = d.total || total;
-    const item = rows.get(d.ip) || { ip: d.ip };
-    Object.assign(item, d);
-    // normalizar campos
-    if (!item.confidence && item.confidence !== 0) item.confidence = 0;
-    if (!item.probe_methods) item.probe_methods = [];
-    rows.set(d.ip, item);
-    scheduleRender();
-  };
-  es.addEventListener("end", ()=> stopScan());
-}
-
-function stopScan(){
-  if (es) { es.close(); es = null; }
-  scheduleRender.flush?.();
-}
-
-// Render “throttled”
-let renderTimer = null;
-function scheduleRender(){
-  if (renderTimer) return;
-  renderTimer = setTimeout(()=>{ render(); renderTimer=null; }, 50);
-}
-scheduleRender.flush = ()=>{ if (renderTimer){ clearTimeout(renderTimer); render(); renderTimer=null; } };
-
-// CSV
-btnExport.addEventListener("click", ()=>{
-  const hdr = ["ip","name","mac","alive","confidence","probe_methods"];
-  const arr = Array.from(rows.values()).map(r => hdr.map(k => (r[k] ?? "")).join(","));
-  const blob = new Blob([hdr.join(",") + "\\n" + arr.join("\\n")], {type:"text/csv"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "scanlin.csv";
-  a.click();
-  URL.revokeObjectURL(a.href);
-});
-
-// Acciones UI
-btnScan.addEventListener("click", startScan);
-btnStop.addEventListener("click", stopScan);
-onlyUpEl.addEventListener("change", ()=>scheduleRender());
-onlyNewEl.addEventListener("change", ()=>scheduleRender());
-searchEl.addEventListener("input", ()=>scheduleRender());
-
-// Orden por cabecera
-qsAll("th[data-sort]").forEach(th=>{
-  th.addEventListener("click", ()=>{
-    const key = th.dataset.sort;
-    if (sortKey === key) sortAsc = !sortAsc; else { sortKey = key; sortAsc = true; }
-    render();
-  });
-});
-
-// No escanear automáticamente al cargar
-</script>
+    // Estado inicial
+    emptyState.classList.remove("hidden");
+  </script>
 </body>
 </html>
+
 """)
 
 
