@@ -1,41 +1,47 @@
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16-alpine
     container_name: scanlin-postgres
     environment:
+      POSTGRES_DB: ${POSTGRES_DB:-scanlin}
       POSTGRES_USER: ${POSTGRES_USER:-scanlin}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clave_segura}
-      POSTGRES_DB: ${POSTGRES_DB:-scanlindb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scanlin}
     volumes:
-      - pgdata:/var/lib/postgresql/data
-    networks: [backend]
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   gateway:
     build:
       context: .
       dockerfile: api/Dockerfile
+      # (opcional) si quieres pasar el build-arg desde compose:
+      args:
+        DEBUG_TOOLS: ${DEBUG_TOOLS:-0}
+    image: scanlin-gateway:latest
     container_name: scanlin-gateway-1
+    ports: []   # con macvlan, nada que publicar
     environment:
-      POSTGRES_USER: "${POSTGRES_USER:-scanlin}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-clave_segura}"
-      POSTGRES_DB: "${POSTGRES_DB:-scanlindb}"
-      DB_HOST: "postgres"
-      DB_PORT: "5432"
-      ENABLE_ARPING: "1"
-      ARP_IFACE: "eth0"   # ajusta la interfaz si es otra en tu host/contenedor
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-scanlin}:${POSTGRES_PASSWORD:-scanlin}@postgres:5432/${POSTGRES_DB:-scanlin}"
     depends_on:
-      - postgres
-    cap_add:
-      - NET_RAW
-    ports:
-      - "${GATEWAY_PORT:-8020}:8000"
+      postgres:
+        condition: service_healthy
     networks:
-      - backend
-    restart: unless-stopped
-
+      backend:
+      lan:
+        ipv4_address: ${SCANLIN_IP}
 
 volumes:
-  pgdata:
+  db_data:
 
 networks:
   backend:
+    driver: bridge
+  lan:
+    external: true
+    name: scanlin_macvlan
