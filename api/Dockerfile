@@ -1,31 +1,47 @@
-# Dockerfile (recomendado para tu estructura actual)
+# Dockerfile
 FROM python:3.11-slim
 
+# -------- Entorno base --------
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    API_PORT=8000
+    UVICORN_HOST=0.0.0.0 \
+    UVICORN_PORT=8000 \
+    UVICORN_WORKERS=1 \
+    UVICORN_LOG=info
 
+# Herramientas opcionales de debug en build: --build-arg DEBUG_TOOLS=1
+ARG DEBUG_TOOLS=0
+
+# Paquetes del sistema (mínimos) + opcionales de debug
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      iproute2 iputils-ping iputils-arping dnsutils net-tools curl libpq5 ca-certificates; \
+    if [ "$DEBUG_TOOLS" = "1" ]; then \
+      apt-get install -y --no-install-recommends tcpdump procps socat; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
+
+# -------- App Python --------
 WORKDIR /app
 
-# Copiamos requirements desde la raíz del build context
+# Congela capa de deps
 COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip wheel \
+ && pip install --no-cache-dir -r /app/requirements.txt
 
-# Herramientas útiles para debugging en contenedor
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-    iproute2 iputils-ping net-tools socat gcc libpq-dev arping \
-    avahi-utils samba-common-bin curl \
- && rm -rf /var/lib/apt/lists/*
-
-
-# Instalar dependencias Python
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-# Copiamos todo el proyecto en /app
+# Copiamos el proyecto completo (api/, etc.)
 COPY . /app
 
-# Exponer puerto (interno del contenedor)
+# Usuario no-root
+RUN addgroup --system app && adduser --system --ingroup app app
+USER app
+
 EXPOSE 8000
 
-# Comando de arranque
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+# Healthcheck a la API
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:${UVICORN_PORT}/status || exit 1
+
+# Arranque: uvicorn parametrizable por envs
+CMD ["sh","-c","exec uvicorn api.main:app --host ${UVICORN_HOST} --port ${UVICORN_PORT} --proxy-headers --log-level ${UVICORN_LOG} --timeout-keep-alive 75"]
