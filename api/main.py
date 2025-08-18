@@ -9,6 +9,9 @@ app = FastAPI()
 @app.on_event("startup")
 async def on_startup():
     await init_db()
+    # cargar OUI en memoria
+    await ensure_oui_loaded()
+    print(f"[OUI] Prefijos disponibles en memoria: {oui_count()}")
 
 # Healthcheck sin versión
 app.include_router(status.router)
@@ -29,3 +32,4 @@ def custom_openapi():
     return app.openapi_schema
 
 app.openapi = custom_openapi
+
