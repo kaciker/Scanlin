@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from api.routers import status, devices, scan
 from api.database import init_db
 from fastapi.openapi.utils import get_openapi
+from api.utils.oui import ensure_oui_loaded, oui_count
 
 app = FastAPI()
 
