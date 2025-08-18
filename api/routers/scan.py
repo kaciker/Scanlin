@@ -11,6 +11,7 @@ from api.database import get_session
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime
 import ping3
+from api.utils.oui import mac_to_vendor  # ⬅️ ya importado en tu versión
 
 router = APIRouter(tags=["scan"])
 semaforo = Semaphore(32)
@@ -247,6 +248,7 @@ async def scan_subnet(request: Request, session: AsyncSession = Depends(get_sess
         name_info = await resolve_name_best_effort_async(ip)
         name = name_info.get("name", "") or f"Host {ip}"
         mac = await asyncio.to_thread(get_mac_best_effort, ip)
+        vendor = mac_to_vendor(mac)  # ⬅️ NUEVO: fabricante
 
         q = await session.execute(select(Device).where(Device.ip == ip))
         existente = q.scalars().first()
@@ -257,11 +259,18 @@ async def scan_subnet(request: Request, session: AsyncSession = Depends(get_sess
                 existente.name = name
             if mac:
                 existente.mac = mac
+            # ⬇️ Solo si el modelo ya tiene la columna vendor
+            if hasattr(existente, "vendor"):
+                existente.vendor = vendor
         else:
-            session.add(Device(
+            dev = Device(
                 name=name,
                 ip=ip, mac=mac, os="", last_seen=datetime.utcnow(), tags=tag
-            ))
+            )
+            # ⬇️ Solo si el modelo ya tiene la columna vendor
+            if hasattr(dev, "vendor"):
+                setattr(dev, "vendor", vendor)
+            session.add(dev)
             nuevos.append(ip)
 
     await session.commit()
@@ -428,12 +437,19 @@ async def scan_stream(
                                             existente.name = d["name"]
                                         if d.get("mac"):
                                             existente.mac = d["mac"]
+                                        # ⬇️ Solo si existe el atributo vendor en el modelo
+                                        if hasattr(existente, "vendor") and d.get("vendor") is not None:
+                                            existente.vendor = d["vendor"]
                                     else:
-                                        sess.add(Device(
+                                        dev = Device(
                                             name=d.get("name") or f"Host {d['ip']}",
                                             ip=d["ip"], mac=d.get("mac", ""), os="",
                                             last_seen=datetime.utcnow(), tags=tag
-                                        ))
+                                        )
+                                        # ⬇️ Solo si existe el atributo vendor en el modelo
+                                        if hasattr(dev, "vendor"):
+                                            setattr(dev, "vendor", d.get("vendor", ""))
+                                        sess.add(dev)
                             buf = []
                         break
 
@@ -449,12 +465,19 @@ async def scan_stream(
                                         existente.name = d["name"]
                                     if d.get("mac"):
                                         existente.mac = d["mac"]
+                                    # ⬇️ Solo si existe el atributo vendor en el modelo
+                                    if hasattr(existente, "vendor") and d.get("vendor") is not None:
+                                        existente.vendor = d["vendor"]
                                 else:
-                                    sess.add(Device(
+                                    dev = Device(
                                         name=d.get("name") or f"Host {d['ip']}",
                                         ip=d["ip"], mac=d.get("mac", ""), os="",
                                         last_seen=datetime.utcnow(), tags=tag
-                                    ))
+                                    )
+                                    # ⬇️ Solo si existe el atributo vendor en el modelo
+                                    if hasattr(dev, "vendor"):
+                                        setattr(dev, "vendor", d.get("vendor", ""))
+                                    sess.add(dev)
                         buf = []
 
             writer_task = asyncio.create_task(db_writer(queue, session))
@@ -477,10 +500,13 @@ async def scan_stream(
                 d["name"] = name_info.get("name", "")
                 d["name_source"] = name_info.get("source", "")
                 d["mac"] = await asyncio.to_thread(get_mac_best_effort, ip)
+                # ⬇️ NUEVO: calcular fabricante con OUI
+                d["vendor"] = mac_to_vendor(d.get("mac", ""))
             else:
                 d["name"] = ""
                 d["name_source"] = ""
                 d["mac"] = ""
+                d["vendor"] = ""  # ⬅️ explicitamos campo para UI/CSV
             return d
 
         # Lanzamos workers concurrentes (controlados por semáforo interno del ping)
@@ -492,7 +518,7 @@ async def scan_stream(
             try:
                 d = await coro
             except Exception:
-                d = {"ip": "error", "alive": False, "confidence": 0.0, "probe_methods": []}
+                d = {"ip": "error", "alive": False, "confidence": 0.0, "probe_methods": [], "vendor": ""}
             done += 1
 
             # si persistimos, encolar solo los vivos
@@ -892,12 +918,13 @@ async def scan_ui():
     // ---- Eventos UI ----
     btnScan.addEventListener("click", startScan);
     btnStop.addEventListener("click", stopScan);
+    onlyAlive.addEventListener("change", render); // <--- AÑADE ESTA LÍNEA
+
     document.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter" && !ev.metaKey && !ev.ctrlKey && !ev.shiftKey && !ev.altKey) {
         startScan();
       }
     });
-
     // Estado inicial
     emptyState.classList.remove("hidden");
   </script>
@@ -905,6 +932,4 @@ async def scan_ui():
 </html>
 
 """)
-
-
 # EOF
