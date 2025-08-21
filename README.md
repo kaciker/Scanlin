@@ -1,47 +1,186 @@
-# ScanLin — README
+# ScanLin — Final Summary (what we shipped)
 
-## Resumen
-ScanLin: backend FastAPI para exploración y gestión de red local (gateway + Postgres + optional ui_port proxy/socat). Soporta escaneo por subred, SSE para UI, y persistencia en Postgres.
+This section summarizes the work completed so you can paste it at the end of your GitHub README.
 
-## Archivos importantes
-- `/api/main.py` — arranque FastAPI. :contentReference[oaicite:3]{index=3}
-- `/api/database.py` — engine asyncpg y sesión; revisar pool/timeouts. :contentReference[oaicite:4]{index=4}
-- `/api/routers/scan.py` — lógica de escaneo y persistencia por IP. :contentReference[oaicite:5]{index=5}
-- `/api/routers/devices.py` — endpoints CRUD de devices. :contentReference[oaicite:6]{index=6}
+---
 
-## Variables .env mínimas (ejemplo)
-POSTGRES_USER=scanlin
-POSTGRES_PASSWORD=clave_segura
-POSTGRES_DB=scanlindb
-DB_HOST=postgres
-DB_PORT=5432
-API_PORT=8000
+## What’s new
 
+* **Vendor (OUI) lookup** end‑to‑end (scanner → API → DB → UI column "Fabricante").
+* **Local/Offline OUI database** support with graceful fallback.
+* **Multi‑target scanning**: the subnet input now accepts **CIDR, single IPs, and ranges** (e.g., `192.168.31.0/24, 192.168.31.200-192.168.31.220 192.168.31.252`).
+* **Search box** (live filter) across **IP / MAC / Name / Vendor**.
+* **SSE UI polish**: spinner + slow‑start banner + progress stats.
+* **Probe API** (`/v2/probe`) for quick host diagnosis (alive, methods, confidence).
 
-## Crear red macvlan (si necesitas que el contenedor tenga visibilidad L2)
+---
 
-docker network create -d macvlan
---subnet=192.168.31.0/24
---gateway=192.168.31.254
--o parent=eth0
-scanlin_macvlan
+## OUI (Vendor) lookup
 
-> Si no puedes crear macvlan por permisos/IT, usa `bridge` para pruebas.
+### Data sources
 
-## Despliegue local (ejemplo)
-1. `docker compose up -d --build`
-2. `curl http://localhost:8020/status`  (ajusta host/puerto según proxy ui_port). :contentReference[oaicite:7]{index=7}
+* **Preferred (offline / reliable):** Wireshark `manuf` file.
+* **Optional (online):** IEEE `oui.csv` (can rate‑limit; we disable by default).
 
-## Troubleshooting (prioridad alta)
-- `asyncpg TimeoutError` → aumentar pool size en `database.py`, revisar commits frecuentes y considerer write-queue por lotes.
-- Latencia SSE al arrancar en /24 → causa habitual: muchas operaciones DB síncronas por host; activar `UI-only` para escaneos grandes. :contentReference[oaicite:8]{index=8}
+### File locations & env vars
 
-## Recomendaciones rápidas
-1. Implementar endpoint `scan/ui` que no use BD (UI-only) para pruebas interactivas. (Incluyo snippet más abajo.)
-2. Implementar write-queue asíncrona que consuma resultados y haga commit por batch (ej. 50 items o cada 3s).
-3. Ajustar pool asyncpg (min/max), timeouts y `pool_pre_ping` en `database.py`. :contentReference[oaicite:9]{index=9}
+* Mount a writable volume and place your OUI file there:
 
-(…README continúa con pasos de CI, tests y más…)
+```yaml
+# docker-compose.yml
+services:
+  gateway:
+    volumes:
+      - ./data:/app/data
+    environment:
+      OUI_MANUF: "/app/data/manuf"   # path to wireshark manuf
+      OUI_URL: ""                     # keep empty to avoid IEEE download
+```
 
+Download & seed (host):
 
+```bash
+curl -o data/manuf \
+  https://raw.githubusercontent.com/wireshark/wireshark/release-4.0/manuf
+```
 
+Logs on startup should show something like:
+
+```
+[OUI] Loaded 52k prefixes from /app/data/manuf (manuf)
+```
+
+### Library entry points
+
+* `api/utils/oui.py` — `ensure_oui_loaded()` and `mac_to_vendor(mac)`.
+* Scanner uses it for each MAC; UI displays the result in the **Fabricante** column.
+
+---
+
+## Database change (Device.vendor)
+
+Add a `vendor TEXT` column once (safe if repeated):
+
+```bash
+docker exec -it scanlin-postgres \
+  psql -U scanlin -d scanlindb \
+  -c "ALTER TABLE device ADD COLUMN IF NOT EXISTS vendor TEXT;"
+```
+
+Quick check:
+
+```bash
+docker exec -it scanlin-postgres \
+  psql -U scanlin -d scanlindb \
+  -c "SELECT ip, mac, vendor, name, last_seen FROM device ORDER BY ip LIMIT 20;"
+```
+
+ORM notes:
+
+* The API updates `vendor` on upsert if the model attribute exists; otherwise it’s ignored (backward compatible).
+
+---
+
+## Multi‑target scanning
+
+The subnet field accepts:
+
+* **CIDR:** `192.168.31.0/24`
+* **IP range:** `192.168.31.200-192.168.31.220`
+* **Single IPs:** `192.168.31.252`
+* Any combination separated by **space/comma/semicolon**.
+
+Internally this is handled by `parse_targets()`; SSE stream and classic `/v2/scan` both use it.
+
+---
+
+## UI changes
+
+* New **Search** input (live filter) matching **IP / MAC / Name / Vendor**.
+* **Only alive** toggle and **Auto‑resolve names** toggle.
+* Spinner (blue → amber → red) + **slow‑start banner** when DNS/DB are slow on cold start.
+* Progress bar and `X / Y` stats while SSE delivers results.
+
+---
+
+## Name resolution notes
+
+Name is best‑effort via the following chain:
+
+1. **DNS PTR** (reverse lookup)
+2. **mDNS** (`avahi-resolve-address` if installed in the container)
+3. **NBNS/NetBIOS** (`nmblookup` if installed)
+4. **HTTP/HTTPS** page `<title>` (ports 80/8080/443)
+
+If a device has no PTR and no mDNS/NBNS, and port 80/443 does not expose a page with `<title>`, the name will be empty. This is expected behavior.
+
+**OpenWrt tip:** Some builds redirect `http://<ip>/` to `:8080`. Either allow 8080 from LAN or configure `uhttpd` to listen on port 80 to let the title resolver work. Publishing PTR records in your LAN DNS is the cleanest fix.
+
+---
+
+## Useful cURL commands
+
+Start a live scan (SSE) and persist results:
+
+```bash
+curl -N "http://<GATEWAY_IP>:8000/v2/scan/stream?subnet=192.168.31.0/24&tag=ui&persist=true" | head -n 30
+```
+
+Quick probe of one IP:
+
+```bash
+curl -s "http://<GATEWAY_IP>:8000/v2/probe?ip=192.168.31.7" | python3 -m json.tool
+```
+
+Verify OUI file inside container:
+
+```bash
+docker exec -it scanlin-gateway-1 ls -lh /app/data/manuf
+```
+
+Troubleshoot names from the container:
+
+```bash
+docker exec -it scanlin-gateway-1 sh -lc '
+ ip=192.168.31.7;
+ echo "PTR:"; dig +short -x $ip || true; echo;
+ echo "HTTP title:"; curl -m 3 -ksS http://$ip/ | tr -d "\n\r" | sed -n "s:.*<title>\(.*\)</title>.*:\1:p" || true;
+'
+```
+
+(Optional) enable mDNS/NBNS tools for diagnostics in the container:
+
+```bash
+# one-off (non persistent)
+docker exec -u root -it scanlin-gateway-1 sh -lc '
+  set -eux; apt-get update;
+  apt-get install -y --no-install-recommends avahi-utils samba-common-bin;
+'
+```
+
+---
+
+## Docker & networking
+
+* For **macvlan deployments**, no ports are published; give the container a LAN IP and access the API via that address.
+* For **bridge deployments**, expose `8000:8000` as needed.
+* Always mount `./data` → `/app/data` so the OUI database persists across rebuilds.
+
+---
+
+## Known limitations
+
+* Manufacturer lookup is prefix‑based and best‑effort; randomized MACs (phones/IoT in privacy mode) won’t map.
+* Names depend on DNS/mDNS/NBNS/HTTP; if none provide a value, the UI will show an empty name.
+* Multi‑target scans can be heavy on very wide ranges; use reasonable concurrency.
+
+---
+
+## Quick checklist
+
+* [ ] `ALTER TABLE device ADD COLUMN IF NOT EXISTS vendor TEXT;`
+* [ ] `data/manuf` present and `OUI_MANUF` set to `/app/data/manuf`.
+* [ ] UI shows **Fabricante** column and live **Search** input.
+* [ ] Logs show OUI prefixes loaded on startup.
+* [ ] `/v2/probe?ip=…` returns JSON.
+* [ ] SSE `/v2/scan/stream` streams results and progress.
